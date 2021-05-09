@@ -1,7 +1,7 @@
 # How to build your own model
 
 ---
- **Note:** _This requires version >= 4.1.X_
+ **Note:** _This model interface requires version >= 4.3.X_
 
 ---
 
@@ -27,15 +27,20 @@ inherit from `KerasPilot` and initialize your model:
 
 ```python
 class KerasSensors(KerasPilot):
-    def __init__(self, input_shape=(120, 160, 3), num_sensors=2):
-        super().__init__()
+    def __init__(self, interpreter=KerasInterpreter(), 
+                 input_shape=(120, 160, 3), num_sensors=2):
         self.num_sensors = num_sensors
-        self.model = self.create_model(input_shape)
+        super().__init__(interpreter, input_shape)
 ```
-Here, you implement the [keras model](https://www.tensorflow.org/guide/keras/sequential_model)
-in the member function `create_model()`. The model needs to have labelled input
-and output tensors. These are required for the training to work.
+Note, the base class will call the `create_model` function and therefore must be run after all members that are required in `create_model` have been initialized. 
 
+Then, you implement the [keras model](https://www.tensorflow.org/guide/keras/sequential_model) in the member function `create_model()`. The model needs to have labelled input  and output tensors. These are required for the training to work.
+
+```python
+def create_model(self):
+    return default_n_linear(self.num_outputs, self.input_shape)
+
+```
 
 ## Training interface
 
@@ -60,17 +65,24 @@ def x_transform(self, record: TubRecord):
     return img_arr
 ```
 
-In this function you define how to extract the input data from your
-recorded data. This data is usually called `X` in the ML frame work . We have
-shown the implementation in the base class which works for all models that have
-only the image as input. 
+In this function you define how to extract the input data from your recorded data. This data is usually called `X` in the ML framework . We have shown the implementation in the base class which works for all models that have only the image as input. 
 
-The function returns a single data item if the model has only one input. You 
-need to return a tuple if your model uses more input data.
+The function returns a single data item if the model has only one input. You need to return a tuple if your model uses more input data.
 
+```python
+def x_transform_and_process(self, record, img_processor):
+    """ Transforms the record into x for training the model to x,y,
+        here we assume the model only takes the image as input. """
+    x_img = self.x_transform(record)
+    # apply augmentation / normalisation
+    x_process = img_processor(x_img)
+    return x_process
 
-**Note:** _If your model has more inputs, the tuple needs to have the image in 
-the first place._ 
+```
+
+This function is required within the training to provide additional image augmentation.
+
+**Note:** _If your model has more inputs, the tuple needs to have the image in the first place._ 
 
 ```python
 def y_transform(self, record: TubRecord):
@@ -78,21 +90,14 @@ def y_transform(self, record: TubRecord):
     throttle: float = record.underlying['user/throttle']
     return angle, throttle
 ```
-In this function you specify how to extract the `y` values (i.e. target
-values) from your recorded data.
+In this function you specify how to extract the `y` values (i.e. target values) from your recorded data.
 
 
 ```python
 def x_translate(self, x: XY) -> Dict[str, Union[float, np.ndarray]]:
     return {'img_in': x}
 ```
-Here we require a translation of how the `X` value that you extracted above will
-be fed into `tf.data`. Note, `tf.data` expects a dictionary if the model has
-more than one input variable, so we have chosen to use dictionaries also in the
-one-argument case for consistency. Above we have shown the implementation in the
-base class which works for all models that have only the image as input. You
-don't have to overwrite neither `x_transform` nor `x_translate` if your 
-model only uses the image as input data.
+Here we require a translation of how the `X` value that you extracted above will be fed into `tf.data`. Note, `tf.data` expects a dictionary if the model has more than one input variable, so we have chosen to use dictionaries also in the one-argument case for consistency. Above we have shown the implementation in the base class which works for all models that have only the image as input. You don't have to overwrite neither `x_transform` nor `x_translate` if your model only uses the image as input data.
 
 
 **Note:** _the keys of the dictionary must match the name of the **input** 
@@ -123,9 +128,7 @@ def output_shapes(self):
                'throttle_out': tf.TensorShape([20])})
     return shapes
 ```
-This function returns a tuple of _two_ dictionaries that tells tensorflow which
-shapes are used in the model. We have shown the example of the 
-`KerasCategorical` model here.
+This function returns a tuple of _two_ dictionaries that tells tensorflow which shapes are used in the model. We have shown the example of the `KerasCategorical` model here.
 
 
 **Note 1:** _As above, the keys of the two dictionaries must match the name 
@@ -141,21 +144,15 @@ type has to be `tf.TensorShape([])`._
 In the car application the model is called through the `run()` function. That
 function is already provided in the base class where the normalisation of the
 input image is happening centrally. Instead, the derived classes have to
-implement
-`inference()` which works on the normalised data. If you have additional data
-that needs to be normalised, too, you might want to override `run()` as well.
+implement `interpreter_to_output()` which transforms the output of the model's interpreter back into the expected steering / throttle.
+
 ```python
-def inference(self, img_arr, other_arr):
-    img_arr = img_arr.reshape((1,) + img_arr.shape)
-    outputs = self.model.predict(img_arr)
-    steering = outputs[0]
-    throttle = outputs[1]
-    return steering[0][0], throttle[0][0]
+def interpreter_to_output(self, interpreter_out):
+    steering = interpreter_out[0]
+    throttle = interpreter_out[1]
+    return steering[0], throttle[0]
 ```
-Here we are showing the implementation of the linear model. Please note that 
-the input tensor shape always contains the batch dimension in the first 
-place, hence the shape of the input image is adjusted from 
-`(120, 160, 3) -> (1, 120, 160, 3)`.
+Here we are showing the implementation of the linear model. Please note that the input tensor shape always contains the batch dimension in the first place, hence the shape of the input image is adjusted from `(120, 160, 3) -> (1, 120, 160, 3)`, and the return values have the additional batch dimensions, too. Therefore, we have to call `[0]` on the outputs.
 
 
 **Note:** _If you are passing another array in the`other_arr` variable, you will
@@ -174,12 +171,13 @@ but has following changes w.r.t. input data and network design:
 
 ### Building the model using keras   
 So here is the example model:
+
 ```python
 class KerasSensors(KerasPilot):
-    def __init__(self, input_shape=(120, 160, 3), num_sensors=2):
-        super().__init__()
+    def __init__(self, interpreter=KerasInterpreter(),
+                 input_shape=(120, 160, 3), num_sensors=2):
         self.num_sensors = num_sensors
-        self.model = self.create_model(input_shape)
+        super().__init__(interpreter, input_shape)
 
     def create_model(self, input_shape):
         drop = 0.2
@@ -211,13 +209,10 @@ class KerasSensors(KerasPilot):
     def compile(self):
         self.model.compile(optimizer=self.optimizer, loss='mse')
 
-    def inference(self, img_arr, other_arr):
-        img_arr = img_arr.reshape((1,) + img_arr.shape)
-        sens_arr = other_arr.reshape((1,) + other_arr.shape)
-        outputs = self.model.predict([img_arr, sens_arr])
-        steering = outputs[0]
-        throttle = outputs[1]
-        return steering[0][0], throttle[0][0]
+    def interpreter_to_output(self, interpreter_out):
+        steering = interpreter_out[0]
+        throttle = interpreter_out[1]
+        return steering[0], throttle[0]
 
     def x_transform(self, record: TubRecord) -> XY:
         img_arr = super().x_transform(record)
@@ -226,6 +221,14 @@ class KerasSensors(KerasPilot):
         # we need to return the image data first
         return img_arr, sensor_arr
 
+    def x_transform_and_process(self, record, img_processor):
+        """ Transforms the record into x for training the model to x,y,
+            here we assume the model only takes the image as input. """
+        x_img, x_sensor = self.x_transform(record)
+        # apply augmentation / normalisation
+        x_process = img_processor(x_img)
+        return x_process, x_sensor
+    
     def x_translate(self, x: XY) -> Dict[str, Union[float, np.ndarray]]:
         assert isinstance(x, tuple), 'Requires tuple as input'
         # the keys are the names of the input layers of the model
@@ -246,10 +249,11 @@ class KerasSensors(KerasPilot):
 
     def output_shapes(self):
         # need to cut off None from [None, 120, 160, 3] tensor shape
-        img_shape = self.get_input_shape()[1:]
+        img_shape = self.get_input_shapes()[0][1:]
+        sensor_shape = self.get_input_shapes()[1][1:]
         # the keys need to match the models input/output layers
         shapes = ({'img_in': tf.TensorShape(img_shape),
-                   'sensor_in': tf.TensorShape([self.num_sensors])},
+                   'sensor_in': tf.TensorShape(sensor_shape)},
                   {'n_outputs0': tf.TensorShape([]),
                    'n_outputs1': tf.TensorShape([])})
         return shapes
@@ -305,13 +309,15 @@ function `get_model_by_type()` in the module `donkeycar/utils.py`:
 ```python
 ...
 elif model_type == 'sensor':
-    kl = KerasSensors(input_shape=input_shape)
+    kl = KerasSensors(interpreter=interpreter, input_shape=input_shape)
 ...
 ```
 
 ### Go train
-In your car app folder now the following should work:
-`donkey train --tub data2/tub_sensor --model models/pilot.h5 --type sensor`
+In your car app folder, now the following should work:
+```bash 
+donkey train --tub data2/tub_sensor --type sensor
+```
 Because of the random values in the data the model will not converge quickly,
 the goal here is to get it working in the framework.
 
